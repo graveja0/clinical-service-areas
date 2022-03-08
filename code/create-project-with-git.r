@@ -7,3 +7,7 @@
 
 # usethis::use_git()
 
+# 5. Stage and commit this project using the Rstudio git interface.
+
+# 6. Link with github using the following command:
+usethis::use_github()
