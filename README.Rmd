@@ -1,0 +1,277 @@
+---
+title: "README"
+author: "John Graves"
+date: "3/8/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(glue)
+library(tigris)
+library(sf)
+library(ggthemes)
+rename_in_list <- function(x,from, to) {
+    x %>% rename_at(vars(contains(from)), funs(sub(from, to, .)))
+}
+library(aws.s3)
+library(flyio) #install_github("atlanhq/flyio")
+
+if (Sys.getenv("LOGNAME") == "gravesj") source("~/auth-aws.r")
+project_bucket <- "health-care-markets"
+get_aws_files <- function(project_bucket = "vumc.graves.networks.proj", prefix = "") {
+    get_bucket(project_bucket, prefix = prefix) %>%
+        transpose() %>%
+        purrr::pluck("Key") %>%
+        unlist() %>%
+        tbl_df()
+}
+shapefiles <- get_aws_files(project_bucket = project_bucket, prefix = "tidy-mapping-files") 
+
+flyio_set_datasource("s3")
+flyio::flyio_set_bucket(project_bucket)
+
+```
+
+```{r}
+
+
+if (!exists(here("data/aha/aha-2018.rds"))) {
+    aha_files <- c(
+        "2018" = "../../Research-AHA_Data/data/aha/annual/raw/2018/ASDB FY 2018/COMMA/ASPUB18.CSV",
+        "2017" = "../../Research-AHA_Data/data/aha/annual/raw/2017/FY2017 ASDB/COMMA/ASPUB17.CSV",
+        "2016" = "../../Research-AHA_Data/data/aha/annual/raw/2016/FY2016 Annual Survey Database/COMMA/ASPUB16.CSV",
+        "2015" = "../../Research-AHA_Data/data/aha/annual/raw/2015/FY2015 Annual Survey Database/COMMA/ASPUB15.CSV"
+    )
+    aha_files <- aha_files[["2018"]]
+
+    df_aha <- 
+        aha_files %>% 
+        map(~(
+            data.table::fread(here(.x)) %>% 
+                janitor::clean_names() %>% 
+                mutate(system_id = ifelse(!is.na(sysid),paste0("SYS_",sysid),id)) %>% 
+                filter(serv==10))) %>% 
+        map(~rename_in_list(x = .x, from = "hcfaid", to = "mcrnum")) %>% 
+        map(~(.x %>% 
+                  select(mname, id, mcrnum , latitude = lat, longitude = long, hrrnum = hrrcode, 
+                         hsanum = hsacode, admtot, system_id, mloczip, sysname,
+                         fips_code=fcounty,mloccity ) %>% 
+                  mutate(hrrnum = paste0(hrrnum)) %>% 
+                  mutate(hsanum = paste0(hsanum)) %>% 
+                  mutate(prvnumgrp = str_pad(mcrnum,width = 6, pad="0")) %>% 
+                  mutate(hosp_zip_code = str_sub(mloczip,1,5)) %>% 
+                  mutate(longitude = as.numeric(paste0(longitude))) %>% 
+                  mutate(latitude = as.numeric(paste0(latitude))) %>% 
+                  filter(!is.na(longitude) & !is.na(latitude)) %>% 
+                  as_tibble()
+        )) %>% 
+        set_names(names(aha_files)) %>% 
+        bind_rows(.id = "aha_year") %>% 
+        as_tibble() %>% 
+        ungroup() %>% 
+        select(id = mcrnum, x= longitude,  y = latitude, admtot,mname,sysname) %>% 
+        mutate(type = "hospital") %>% 
+        st_as_sf(coords = c("x", "y"), crs = 4326) %>% 
+        mutate(sysname = ifelse(sysname=="" | is.na(sysname), mname, sysname)) %>% 
+        filter(id != "")
+    df_aha %>% write_rds(here("data/aha/aha-2018.rds"))
+} else {
+    df_aha <- read_rds(here("data/aha/aha-2018.rds"))
+}
+
+# Load data
+sf_zip_cent <- # Source: https://mcdc.missouri.edu/applications/geocorr2014.html (2022-02-10)
+    read.csv(here("data/zip-population-centroids/geocorr2014_2204104231.csv"),skip=1) %>% 
+    janitor::clean_names() %>% 
+    as_tibble() %>% 
+    # Some ZIPs straddle states; get the weighted centroid again.
+    group_by(zip_census_tabulation_area) %>% 
+    summarise_at(vars(wtd_centroid_latitude_degrees,wtd_centroid_w_longitude_degrees),
+                 ~weighted.mean(.,w = .data$total_population_2010 )) %>%
+    select(zip_code = zip_census_tabulation_area, 
+           y = wtd_centroid_latitude_degrees, 
+           x =  wtd_centroid_w_longitude_degrees) %>% 
+    st_as_sf(coords = c("x","y"), crs = 4326) %>% 
+    bind_cols(st_coordinates(.) %>% as.tibble() %>% set_names(c("x","y")))  %>% 
+    mutate(zip_code = str_pad(zip_code,width = 5, side ="left",pad = "0"))
+
+edge_list_geography_ <- 
+    read_rds(here(glue("../../health-care-markets/output/hospital-county-patient-data/2017/hospital-zip-patient-data.rds")))
+```
+
+
+```{r}
+get_percent_within <- function(sf) {
+    zips_within <- data.frame(zip_code = sf_zip_cent$zip_code, geo = st_within(sf_zip_cent,sf) %>% as.numeric()) %>% 
+    na.omit()
+
+    hosps_within <- data.frame(prvnumgrp = df_aha$id, within = st_within(df_aha,sf) %>% as.numeric()) 
+    
+    edge_list <- 
+        edge_list_geography_ %>% 
+        arrange(desc(total_cases)) %>% 
+        inner_join(zips_within,"zip_code") %>% 
+        left_join(hosps_within,"prvnumgrp") %>% 
+        mutate(orig_within = within) %>% 
+        mutate(within = ifelse(geo==within,1,0)) %>% 
+        mutate(within = ifelse(is.na(within),0,within)) 
+    
+    
+    edge_list %>% 
+    group_by(within) %>% 
+    summarise(total_cases = sum(total_cases)) %>% 
+    mutate(pct = total_cases / sum(total_cases))
+}
+
+states <- datasets::state.abb
+names(states) <- datasets::state.name
+
+sf_rating <- 
+    shapefiles %>% 
+    filter(grepl("01_rating-area-shape-file_2021.shp",value)) %>% 
+    pull(value) %>% 
+    flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
+    st_transform(crs = 4326) 
+
+sf_hrr <- 
+    shapefiles %>% 
+    filter(grepl("01_hrr-shape-file.shp",value)) %>% 
+    pull(value) %>% 
+    flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
+    st_transform(crs = 4326) 
+
+sf_hsa <- 
+    shapefiles %>% 
+    filter(grepl("01_hsa-shape-file.shp",value)) %>% 
+    pull(value) %>% 
+    flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
+    st_transform(crs = 4326) 
+
+sf_cz <- 
+    shapefiles %>% 
+    filter(grepl("01_commuting-zone-shape-file.shp",value)) %>% 
+    pull(value) %>% 
+    flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
+    st_transform(crs = 4326) 
+
+result <- list()
+
+for (ss in states) {
+    cat(ss)
+    stname <- names(states)[which(states==ss)]
+    
+    sf_state <- 
+        states(year = 2020) %>% 
+        st_transform(crs=4326) %>% 
+        filter_state(stname)
+    
+     within_rating <- 
+         sf_rating %>% 
+         inner_join(
+             data.frame(ratng_r =  sf_rating$ratng_r, 
+                        in_state = 
+                            st_within(
+                            st_centroid(sf_rating) %>% 
+                            st_coordinates() %>% 
+                            as_tibble() %>% 
+                            st_as_sf(coords = c("X","Y"), crs = 4326),
+                            sf_state) %>% as.numeric()
+            ) %>% 
+         filter(in_state==1)) %>% 
+         get_percent_within() %>% 
+         mutate(geography = "rating_area")
+     
+    within_cz <- 
+             sf_cz %>% 
+             inner_join(
+                 data.frame(cz_id =  sf_cz$cz_id, 
+                            in_state = 
+                                st_within(
+                                st_centroid(sf_cz) %>% 
+                                st_coordinates() %>% 
+                                as_tibble() %>% 
+                                st_as_sf(coords = c("X","Y"), crs = 4326),
+                                sf_state) %>% as.numeric()
+                ) %>% 
+             filter(in_state==1)) %>% 
+             get_percent_within() %>% 
+             mutate(geography = "commuting_zone")
+        
+        within_hrr <- 
+             sf_hrr %>% 
+             inner_join(
+                 data.frame(hrrnum =  sf_hrr$hrrnum, 
+                            in_state = 
+                                st_within(
+                                st_centroid(sf_hrr) %>% 
+                                st_coordinates() %>% 
+                                as_tibble() %>% 
+                                st_as_sf(coords = c("X","Y"), crs = 4326),
+                                sf_state) %>% as.numeric()
+                ) %>% 
+             filter(in_state==1)) %>% 
+             get_percent_within() %>% 
+             mutate(geography = "hrr")
+            
+        within_hsa <- 
+             sf_hsa %>% 
+             inner_join(
+                 data.frame(hsanum =  sf_hsa$hsanum, 
+                            in_state = 
+                                st_within(
+                                st_centroid(sf_hsa) %>% 
+                                st_coordinates() %>% 
+                                as_tibble() %>% 
+                                st_as_sf(coords = c("X","Y"), crs = 4326),
+                                sf_state) %>% as.numeric()
+                ) %>% 
+             filter(in_state==1)) %>% 
+             get_percent_within() %>% 
+             mutate(geography = "hsa")
+            
+    within_state <- 
+        sf_state %>% 
+        get_percent_within() %>% 
+        mutate(geography = "state")
+
+    within_county <- 
+        counties(ss,year = 2020) %>% 
+        st_transform(crs = 4326) %>% 
+        get_percent_within() %>% 
+        mutate(geography = "county")
+    
+    within_puma <- 
+        pumas(ss,year = 2020) %>% 
+        st_transform(crs = 4326) %>% 
+        get_percent_within() %>% 
+        mutate(geography = "puma")
+
+    result[[stname]] <- 
+        within_state %>% 
+        bind_rows(within_county) %>% 
+        bind_rows(within_puma) %>% 
+        bind_rows(within_cz) %>% 
+        bind_rows(within_hrr) %>% 
+        bind_rows(within_hsa) %>% 
+        bind_rows(within_rating) %>% 
+        mutate(state=stname) %>% 
+        arrange(desc(pct))
+    cat("\n")
+}
+
+result %>% 
+    bind_rows() %>% 
+    filter(within==1) %>% 
+    ggplot(aes(x = pct, y = state, colour = geography)) + geom_point() + 
+    hrbrthemes::theme_ipsum() + 
+    scale_x_continuous(limits = c(0,1)) +
+    ggsci::scale_colour_jama() +
+    facet_grid(geography~.)
+
+```
+
