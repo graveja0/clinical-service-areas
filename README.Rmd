@@ -31,7 +31,9 @@ get_aws_files <- function(project_bucket = "vumc.graves.networks.proj", prefix =
         tbl_df()
 }
 shapefiles <- get_aws_files(project_bucket = project_bucket, prefix = "tidy-mapping-files") 
+isochrones <- get_aws_files(project_bucket = "vumc.graves.networks.proj", prefix = "data/isochrone-objects/iso_v1-3/")
 
+    
 flyio_set_datasource("s3")
 flyio::flyio_set_bucket(project_bucket)
 
@@ -107,10 +109,51 @@ edge_list_geography_ <-
 
 ```{r}
 get_percent_within <- function(sf) {
-    zips_within <- data.frame(zip_code = sf_zip_cent$zip_code, geo = st_within(sf_zip_cent,sf) %>% as.numeric()) %>% 
-    na.omit()
 
-    hosps_within <- data.frame(prvnumgrp = df_aha$id, within = st_within(df_aha,sf) %>% as.numeric()) 
+    zips_within_ <- st_within(sf_zip_cent,sf,sparse=FALSE) %>% as.matrix()
+    rownames(zips_within_) <- sf_zip_cent$zip_code
+    colnames(zips_within_) <- sf$geoid
+    zips_within <-
+        zips_within_%>%
+        data.frame() %>%
+        rownames_to_column(var = "zip_code") %>%
+        gather(geoid,value,-zip_code) %>%
+        mutate(geoid = gsub("^X","",geoid)) %>%
+        group_by(zip_code) %>%
+        arrange(desc(value)) %>%
+        filter(row_number()==1) %>%
+        mutate(geo = ifelse(value==TRUE,geoid, NA)) %>%
+        ungroup()  %>%
+        select(zip_code, geo)  %>%
+        na.omit() %>%
+        as_tibble()
+
+    zips_within_new <- zips_within
+    
+    # zips_within_old <-
+    #     data.frame(zip_code = sf_zip_cent$zip_code, geo = st_within(sf_zip_cent,sf) %>% as.numeric()) %>%
+    #     na.omit() %>% 
+    #     as_tibble()
+    
+    hosps_within_ <- st_within(df_aha,sf,sparse=FALSE) %>% as.matrix()  
+    rownames(hosps_within_) <- df_aha$id
+    colnames(hosps_within_) <- sf$geoid
+    hosps_within <- 
+        hosps_within_%>% 
+        data.frame() %>% 
+        rownames_to_column(var = "prvnumgrp") %>% 
+        gather(geoid,value,-prvnumgrp) %>% 
+        mutate(geoid = gsub("^X","",geoid)) %>% 
+        group_by(prvnumgrp) %>% 
+        arrange(desc(value)) %>% 
+        filter(row_number()==1) %>% 
+        mutate(within = ifelse(value==TRUE,geoid, NA)) %>% 
+        ungroup()  %>% 
+        select(prvnumgrp, within)  
+    hosps_within_new <- hosps_within
+
+    #hosps_within_old <- data.frame(prvnumgrp = df_aha$id, within = st_within(df_aha,sf) %>% as.numeric())  
+
     
     edge_list <- 
         edge_list_geography_ %>% 
@@ -123,13 +166,14 @@ get_percent_within <- function(sf) {
     
     
     edge_list %>% 
-    group_by(within) %>% 
-    summarise(total_cases = sum(total_cases)) %>% 
-    mutate(pct = total_cases / sum(total_cases))
+        group_by(within) %>% 
+        summarise(total_cases = sum(total_cases)) %>% 
+        mutate(pct = total_cases / sum(total_cases))
 }
 
 states <- datasets::state.abb
 names(states) <- datasets::state.name
+states <- states[-which(states %in% c("HI","AK"))]
 
 sf_rating <- 
     shapefiles %>% 
@@ -159,40 +203,43 @@ sf_cz <-
     flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
     st_transform(crs = 4326) 
 
+
+
 result <- list()
 
 for (ss in states) {
     cat(ss)
     stname <- names(states)[which(states==ss)]
-    
-    sf_state <- 
-        states(year = 2020) %>% 
-        st_transform(crs=4326) %>% 
-        filter_state(stname)
-    
-     within_rating <- 
-         sf_rating %>% 
-         inner_join(
-             data.frame(ratng_r =  sf_rating$ratng_r, 
-                        in_state = 
-                            st_within(
-                            st_centroid(sf_rating) %>% 
-                            st_coordinates() %>% 
-                            as_tibble() %>% 
-                            st_as_sf(coords = c("X","Y"), crs = 4326),
-                            sf_state) %>% as.numeric()
-            ) %>% 
-         filter(in_state==1)) %>% 
-         get_percent_within() %>% 
-         mutate(geography = "rating_area")
-     
-    within_cz <- 
-             sf_cz %>% 
+    if (max(grepl(stname,names(result)))==0) {
+
+        sf_state <- 
+            states(year = 2020) %>% 
+            st_transform(crs=4326) %>% 
+            filter_state(stname)
+        
+        sf_60min <- 
+            isochrones %>% 
+            filter(grepl(glue("{ss}_60min_iso"), value)) %>% 
+            pull(value) %>% 
+            s3readRDS(., bucket ="vumc.graves.networks.proj") %>% 
+            st_transform(crs = 4326) 
+
+        sf_30min <- 
+            isochrones %>% 
+            filter(grepl(glue("{ss}_60min_iso"), value)) %>% 
+            pull(value) %>% 
+            s3readRDS(., bucket ="vumc.graves.networks.proj") %>% 
+            st_transform(crs = 4326) 
+
+        
+         within_rating <- 
+             sf_rating %>% 
+             mutate(geoid = ratng_r) %>% 
              inner_join(
-                 data.frame(cz_id =  sf_cz$cz_id, 
+                 data.frame(ratng_r =  sf_rating$ratng_r, 
                             in_state = 
                                 st_within(
-                                st_centroid(sf_cz) %>% 
+                                st_centroid(sf_rating) %>% 
                                 st_coordinates() %>% 
                                 as_tibble() %>% 
                                 st_as_sf(coords = c("X","Y"), crs = 4326),
@@ -200,9 +247,27 @@ for (ss in states) {
                 ) %>% 
              filter(in_state==1)) %>% 
              get_percent_within() %>% 
-             mutate(geography = "commuting_zone")
-        
+             mutate(geography = "rating_area")
+         
+        within_cz <- 
+                 sf_cz %>% 
+                 mutate(geoid = cz_id) %>% 
+                 inner_join(
+                     data.frame(cz_id =  sf_cz$cz_id, 
+                                in_state = 
+                                    st_within(
+                                    st_centroid(sf_cz) %>% 
+                                    st_coordinates() %>% 
+                                    as_tibble() %>% 
+                                    st_as_sf(coords = c("X","Y"), crs = 4326),
+                                    sf_state) %>% as.numeric()
+                    ) %>% 
+                 filter(in_state==1)) %>% 
+                 get_percent_within() %>% 
+                 mutate(geography = "commuting_zone")
+            
         within_hrr <- 
+            tryCatch({
              sf_hrr %>% 
              inner_join(
                  data.frame(hrrnum =  sf_hrr$hrrnum, 
@@ -215,52 +280,60 @@ for (ss in states) {
                                 sf_state) %>% as.numeric()
                 ) %>% 
              filter(in_state==1)) %>% 
+             mutate(geoid = hrrnum) %>% 
              get_percent_within() %>% 
              mutate(geography = "hrr")
+            },error=function(e) data.frame(within = NA, total_cases = NA, pct = NA, geography = "hrr"))
             
         within_hsa <- 
-             sf_hsa %>% 
-             inner_join(
-                 data.frame(hsanum =  sf_hsa$hsanum, 
-                            in_state = 
-                                st_within(
-                                st_centroid(sf_hsa) %>% 
-                                st_coordinates() %>% 
-                                as_tibble() %>% 
-                                st_as_sf(coords = c("X","Y"), crs = 4326),
-                                sf_state) %>% as.numeric()
-                ) %>% 
-             filter(in_state==1)) %>% 
-             get_percent_within() %>% 
-             mutate(geography = "hsa")
+                 sf_hsa %>% 
+                 inner_join(
+                     data.frame(hsanum =  sf_hsa$hsanum, 
+                                in_state = 
+                                    st_within(
+                                    st_centroid(sf_hsa) %>% 
+                                    st_coordinates() %>% 
+                                    as_tibble() %>% 
+                                    st_as_sf(coords = c("X","Y"), crs = 4326),
+                                    sf_state) %>% as.numeric()
+                    ) %>% 
+                 filter(in_state==1)) %>% 
+                 mutate(geoid = hsanum) %>% 
+                 get_percent_within() %>% 
+                 mutate(geography = "hsa")
+                
+        within_state <- 
+            sf_state %>% 
+            mutate(geoid= STUSPS) %>% 
+            get_percent_within() %>% 
             
-    within_state <- 
-        sf_state %>% 
-        get_percent_within() %>% 
-        mutate(geography = "state")
-
-    within_county <- 
-        counties(ss,year = 2020) %>% 
-        st_transform(crs = 4326) %>% 
-        get_percent_within() %>% 
-        mutate(geography = "county")
+            mutate(geography = "state")
     
-    within_puma <- 
-        pumas(ss,year = 2020) %>% 
-        st_transform(crs = 4326) %>% 
-        get_percent_within() %>% 
-        mutate(geography = "puma")
-
-    result[[stname]] <- 
-        within_state %>% 
-        bind_rows(within_county) %>% 
-        bind_rows(within_puma) %>% 
-        bind_rows(within_cz) %>% 
-        bind_rows(within_hrr) %>% 
-        bind_rows(within_hsa) %>% 
-        bind_rows(within_rating) %>% 
-        mutate(state=stname) %>% 
-        arrange(desc(pct))
+        within_county <- 
+            counties(ss,year = 2020) %>% 
+            st_transform(crs = 4326) %>% 
+            mutate(geoid = paste0(STATEFP,COUNTYFP)) %>% 
+            get_percent_within() %>% 
+            mutate(geography = "county")
+        
+        within_puma <- 
+            pumas(ss,year = 2020) %>% 
+            mutate(geoid = GEOID10) %>% 
+            st_transform(crs = 4326) %>% 
+            get_percent_within() %>% 
+            mutate(geography = "puma")
+    
+        result[[stname]] <- 
+            within_state %>% 
+            bind_rows(within_county) %>% 
+            bind_rows(within_puma) %>% 
+            bind_rows(within_cz) %>% 
+            bind_rows(within_hrr) %>% 
+            bind_rows(within_hsa) %>% 
+            bind_rows(within_rating) %>% 
+            mutate(state=stname) %>% 
+            arrange(desc(pct))
+    }
     cat("\n")
 }
 
