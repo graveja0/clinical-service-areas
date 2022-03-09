@@ -1,0 +1,98 @@
+---
+title: ""
+author: "Hannah"
+date: "1/6/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(here)
+suppressWarnings(suppressMessages(source(here::here("R/manifest.R"))))
+source(here("R/move-ak-hi.R"))
+source(here("R/get-geographic-info.R"))
+source(here("R/map-theme.R"))
+#source(here("R/shared-objects.R"))
+source(here("R/get-contiguous-areas.R"))
+```
+
+
+```{r}
+# STATE FIPS TO STATE ABBREVIATION
+fips_to_state <- read_rds(here("data/geographic-crosswalks/01_xw_county-to-fips.rds")) %>% 
+  mutate(statefp = str_sub(fips_code,1,2)) %>% 
+  select(statefp,state) %>% unique()
+
+county_fips_to_state <- read_rds(here("data/geographic-crosswalks/01_xw_county-to-fips.rds")) %>% 
+  mutate(statefp = str_sub(fips_code,1,2))  %>% 
+  select(fips_code,state)
+```
+
+
+```{r}
+# Source: https://sites.psu.edu/psucz/data/
+county_to_cz <- data.table::fread(here("data/shape-files/commuting-zones/counties10-zqvz0r.csv")) %>% 
+  janitor::clean_names() %>% 
+  rename(fips_code = fips) %>% 
+  group_by(out10) %>% 
+  mutate(commuting_zone_population_2010 = sum(pop10, na.rm=TRUE)) %>% 
+  mutate(fips_code = str_pad(paste0(fips_code),width = 5, pad="0")) %>% 
+  select(fips_code,
+         commuting_zone_id_2010 = out10,
+         commuting_zone_population_2010 )
+```
+
+```{r}
+df_cz <- data.table::fread(here("data/shape-files/commuting-zones/counties10-zqvz0r.csv")) %>% 
+  janitor::clean_names() %>% 
+  rename(fips_code = fips) %>% 
+  group_by(out10) %>% 
+  mutate(commuting_zone_population_2010 = sum(pop10, na.rm=TRUE)) %>% 
+  mutate(fips_code = str_pad(paste0(fips_code),width = 5, pad="0")) %>% 
+  select(fips_code,
+         cz_id = out10 ) %>% 
+  left_join(county_fips_to_state,"fips_code") %>% 
+  select(cz_id,state) %>% 
+  group_by(cz_id) %>% 
+  unique() %>% 
+  mutate(foo = paste0("state_",str_pad(paste0(row_number()),width=2,pad="0"))) %>% 
+  spread(foo,state)
+```
+
+
+```{r}
+cz_info <- county_to_cz %>% 
+  select(contains("commuting_zone")) %>% 
+  unique()
+```
+
+
+```{r}
+# County Shape File
+shp_cz <- sf::read_sf(here("public-data/shape-files/county-2017/cb_2017_us_county_5m/cb_2017_us_county_5m.shp")) %>% 
+  #sf::st_transform(crs = "+proj=laea +lat_0=45 +lon_0=-100 +x_0=0 +y_0=0 +a=6370997 +b=6370997 +units=m +no_defs")  %>% 
+  sf::st_transform(crs ="+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=37.5 +lon_0=-96") %>% 
+  janitor::clean_names() %>% 
+  left_join(fips_to_state,"statefp") %>% 
+  ##move_ak_hi(state = state) %>%
+  mutate(fips_code = geoid) %>% 
+  left_join(county_to_cz, "fips_code") %>%
+  group_by(commuting_zone_id_2010) %>% 
+  summarise() %>% 
+  ungroup() %>% 
+  st_simplify(dTolerance = 100)  %>% 
+  left_join(get_contiguous(shp = ., id = commuting_zone_id_2010) %>% 
+              mutate(commuting_zone_id_2010 = as.integer(commuting_zone_id_2010)), "commuting_zone_id_2010") %>% 
+  rename(cz_id = commuting_zone_id_2010) %>% 
+  left_join(df_cz,"cz_id") %>%
+  mutate(row_id = row_number())
+```
+
+
+```{r}
+shp_cz %>% 
+  sf::write_sf(here("output/tidy-mapping-files/commuting-zone/01_commuting-zone-shape-file.shp"))
+```
