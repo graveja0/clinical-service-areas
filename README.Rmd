@@ -108,9 +108,10 @@ edge_list_geography_ <-
 
 
 ```{r}
-get_percent_within <- function(sf) {
+get_percent_within <- function(sf, isochrone = FALSE) {
 
-    zips_within_ <- st_within(sf_zip_cent,sf,sparse=FALSE) %>% as.matrix()
+    if (!isochrone) {
+        zips_within_ <- st_within(sf_zip_cent,sf,sparse=FALSE) %>% as.matrix()
     rownames(zips_within_) <- sf_zip_cent$zip_code
     colnames(zips_within_) <- sf$geoid
     zips_within <-
@@ -152,9 +153,6 @@ get_percent_within <- function(sf) {
         select(prvnumgrp, within)  
     hosps_within_new <- hosps_within
 
-    #hosps_within_old <- data.frame(prvnumgrp = df_aha$id, within = st_within(df_aha,sf) %>% as.numeric())  
-
-    
     edge_list <- 
         edge_list_geography_ %>% 
         arrange(desc(total_cases)) %>% 
@@ -163,6 +161,36 @@ get_percent_within <- function(sf) {
         mutate(orig_within = within) %>% 
         mutate(within = ifelse(geo==within,1,0)) %>% 
         mutate(within = ifelse(is.na(within),0,within)) 
+    } else {
+        zips_within <- 
+            data.frame(zip_code = sf$zip_code, geo = sf$zip_code)
+        
+        hosps_within_ <- st_within(df_aha,sf,sparse=FALSE) %>% as.matrix()  
+        rownames(hosps_within_) <- df_aha$id
+        colnames(hosps_within_) <- sf$geoid
+        hosps_within <- 
+            hosps_within_%>% 
+            data.frame() %>% 
+            rownames_to_column(var = "prvnumgrp") %>% 
+            gather(geoid,value,-prvnumgrp) %>% 
+            mutate(geoid = gsub("^X","",geoid)) %>% 
+            group_by(prvnumgrp) %>% 
+            arrange(desc(value)) %>% 
+            #filter(row_number()==1) %>% 
+            mutate(within = ifelse(value==TRUE,geoid, NA)) %>% 
+            ungroup()  %>% 
+            select(prvnumgrp, within)  
+        hosps_within_new <- hosps_within
+        
+        edge_list <- 
+            edge_list_geography_ %>% 
+            arrange(desc(total_cases)) %>% 
+            inner_join(zips_within,"zip_code") %>% 
+            left_join(hosps_within %>% mutate(in_iso=1),c("prvnumgrp","zip_code"="within")) %>% 
+            mutate(within = ifelse(is.na(in_iso),0,in_iso)) 
+
+    }
+    
     
     
     edge_list %>% 
@@ -203,9 +231,8 @@ sf_cz <-
     flyio::import_shp(pathshp= . , FUN = sf::read_sf, dir = tempdir()) %>% 
     st_transform(crs = 4326) 
 
-
-
 result <- list()
+result[["null"]] <- data.frame(within = NA, total_cases = NA, pct = NA, geography = "hrr")
 
 for (ss in states) {
     cat(ss)
@@ -217,20 +244,31 @@ for (ss in states) {
             st_transform(crs=4326) %>% 
             filter_state(stname)
         
-        sf_60min <- 
+        within_60min <- 
             isochrones %>% 
             filter(grepl(glue("{ss}_60min_iso"), value)) %>% 
             pull(value) %>% 
             s3readRDS(., bucket ="vumc.graves.networks.proj") %>% 
-            st_transform(crs = 4326) 
+            st_transform(crs = 4326) %>% 
+            mutate(geoid = zip_code) %>% 
+            get_percent_within(isochrone = TRUE) %>% 
+            mutate(geography = "60min")
+        
+        # sf <- sf_60min %>% 
+        #     mutate(geoid = zip_code) 
+            
 
-        sf_30min <- 
+        within_30min <- 
             isochrones %>% 
-            filter(grepl(glue("{ss}_60min_iso"), value)) %>% 
+            filter(grepl(glue("{ss}_30min_iso"), value)) %>% 
             pull(value) %>% 
             s3readRDS(., bucket ="vumc.graves.networks.proj") %>% 
-            st_transform(crs = 4326) 
-
+            #st_simplify(dTolerance = 1)  %>% 
+            st_transform(crs = 4326) %>% 
+            filter(zip_code!="71466")  %>% 
+            mutate(geoid = zip_code) %>% 
+            get_percent_within(isochrone = TRUE) %>% 
+            mutate(geography = "30min")
         
          within_rating <- 
              sf_rating %>% 
@@ -306,7 +344,6 @@ for (ss in states) {
             sf_state %>% 
             mutate(geoid= STUSPS) %>% 
             get_percent_within() %>% 
-            
             mutate(geography = "state")
     
         within_county <- 
@@ -331,20 +368,69 @@ for (ss in states) {
             bind_rows(within_hrr) %>% 
             bind_rows(within_hsa) %>% 
             bind_rows(within_rating) %>% 
+            bind_rows(within_60min) %>% 
+            bind_rows(within_30min) %>% 
             mutate(state=stname) %>% 
             arrange(desc(pct))
     }
     cat("\n")
 }
 
+result %>% write_rds(here("output/results/state-level-zip-to-hospital-use.rds"))
+
+library(directlabels)
+
+
+geo_lut <- c(
+    "30min"   = "30m Drive Time Isochrone"    ,   
+    "60min"   = "60m Drive Time Isochrone",
+    "commuting_zone"  = "Commuting Zone",
+    "county"= "County",
+    "hrr"             = "Hospital Referral Region",
+    "hsa"             = "Hospital Service Area",
+    "puma"          = "Public Use Microdata Area (PUMA)",
+    "rating_area"    = "Health Insurance Rating Area (Marketplaces)",
+    "state"    = "State"
+)
+
+
+us_result <- 
+    result %>% 
+        bind_rows() %>% 
+        na.omit() %>% 
+        mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+        group_by(geography, within) %>% 
+        summarise(total_cases = sum(total_cases)) %>% 
+        group_by(geography) %>% 
+        mutate(pct = total_cases / sum(total_cases)) %>% 
+        filter(within==1) %>% 
+        arrange(desc(pct)) %>% 
+        mutate(state = "United States") 
+
+df_label <- 
+    result %>% 
+    bind_rows() %>% 
+    mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+    filter(within==1)  %>% 
+    as_tibble() %>% 
+    group_by(geography) %>%    
+    filter(pct==max(pct)|pct==min(pct)) %>% 
+    mutate(state = states[state]) %>% 
+    mutate(state = glue("{state} ({round(100*pct,0)}%)") )
+
 result %>% 
     bind_rows() %>% 
     filter(within==1) %>% 
-    ggplot(aes(x = pct, y = state, colour = geography)) + geom_point() + 
+    mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+    ggplot(aes(x = pct, y = geography, group=state)) + geom_point() + 
+    geom_text(data = df_label, aes(label =state),vjust=2,size=3) +
     hrbrthemes::theme_ipsum() + 
     scale_x_continuous(limits = c(0,1)) +
-    ggsci::scale_colour_jama() +
-    facet_grid(geography~.)
+    ggsci::scale_colour_futurama() +
+    geom_point(data = us_result, colour = "red", size=5, pch=3) + 
+    scale_x_continuous(limits = c(0,1),breaks=seq(0,1,0.1), labels = 100*seq(0,1,0.1))+
+    labs(x = "Percent of Hospital Utilization\n Contained Within Area",y="")
+    #facet_grid(geography~.)
 
 ```
 
