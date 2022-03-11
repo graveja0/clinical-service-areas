@@ -8,6 +8,9 @@ editor_options:
 ---
 
 ```{r setup, include=FALSE}
+
+# This section will load in necessary files and packages. 
+
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 library(here)
@@ -15,11 +18,10 @@ library(glue)
 library(tigris)
 library(sf)
 library(ggthemes)
-rename_in_list <- function(x,from, to) {
-    x %>% rename_at(vars(contains(from)), funs(sub(from, to, .)))
-}
 library(aws.s3)
 library(flyio) #install_github("atlanhq/flyio")
+
+# Initialize the Amazon Web Services (AWS) server, where we keep some large data. 
 
 if (Sys.getenv("LOGNAME") == "gravesj") source("~/auth-aws.r")
 project_bucket <- "health-care-markets"
@@ -30,18 +32,25 @@ get_aws_files <- function(project_bucket = "vumc.graves.networks.proj", prefix =
         unlist() %>%
         tbl_df()
 }
-shapefiles <- get_aws_files(project_bucket = project_bucket, prefix = "tidy-mapping-files") 
-isochrones <- get_aws_files(project_bucket = "vumc.graves.networks.proj", prefix = "data/isochrone-objects/iso_v1-3/")
-
-    
 flyio_set_datasource("s3")
 flyio::flyio_set_bucket(project_bucket)
+
+# This is a function that is needed when we load in the AHA data. 
+rename_in_list <- function(x,from, to) {
+    x %>% rename_at(vars(contains(from)), funs(sub(from, to, .)))
+}
+
 
 ```
 
 ```{r}
+# These are the filenames for various shapefiles and isochrone files we have on AWS. 
+shapefiles <- get_aws_files(project_bucket = project_bucket, prefix = "tidy-mapping-files") 
+isochrones <- get_aws_files(project_bucket = "vumc.graves.networks.proj", prefix = "data/isochrone-objects/iso_v1-3/")
 
-
+# This set of code creates a hospital-level dataset based on the American Hospital Association survey data.
+# it only runs the code if the following data file does not exist (which it now does, so this code does not
+# need to be run again. )
 if (!exists(here("data/aha/aha-2018.rds"))) {
     aha_files <- c(
         "2018" = "../../Research-AHA_Data/data/aha/annual/raw/2018/ASDB FY 2018/COMMA/ASPUB18.CSV",
@@ -86,7 +95,7 @@ if (!exists(here("data/aha/aha-2018.rds"))) {
     df_aha <- read_rds(here("data/aha/aha-2018.rds"))
 }
 
-# Load data
+# Load data on the population-weighted centroid of each ZCTA. 
 sf_zip_cent <- # Source: https://mcdc.missouri.edu/applications/geocorr2014.html (2022-02-10)
     read.csv(here("data/zip-population-centroids/geocorr2014_2204104231.csv"),skip=1) %>% 
     janitor::clean_names() %>% 
@@ -102,8 +111,13 @@ sf_zip_cent <- # Source: https://mcdc.missouri.edu/applications/geocorr2014.html
     bind_cols(st_coordinates(.) %>% as.tibble() %>% set_names(c("x","y")))  %>% 
     mutate(zip_code = str_pad(zip_code,width = 5, side ="left",pad = "0"))
 
+# This is the "edge list" file telling us how many FFS Medicare patients from each ZIP go to each hospital. 
+# This file is created in health-care-markets/R/read-and-tidy-cms-hospital-service-area-file.r, though the
+# underlying raw data are obtained from
+# https://www.cms.gov/Research-Statistics-Data-and-Systems/Statistics-Trends-and-Reports/Hospital-Service-Area-File/index.html
+
 edge_list_geography_ <- 
-    read_rds(here(glue("../../health-care-markets/output/hospital-county-patient-data/2017/hospital-zip-patient-data.rds")))
+    read_rds(here(glue("../../health-care-markets/output/hospital-county-patient-data/2020/hospital-zip-patient-data.rds")))
 ```
 
 
@@ -398,30 +412,39 @@ us_result <-
     result %>% 
         bind_rows() %>% 
         na.omit() %>% 
-        mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+        mutate(geography = paste0(factor(geography, levels = names(geo_lut), labels = geo_lut))) %>% 
         group_by(geography, within) %>% 
         summarise(total_cases = sum(total_cases)) %>% 
         group_by(geography) %>% 
         mutate(pct = total_cases / sum(total_cases)) %>% 
         filter(within==1) %>% 
         arrange(desc(pct)) %>% 
-        mutate(state = "United States") 
+        mutate(state = "United States")  %>% 
+    arrange(pct) %>% 
+    mutate(geography = factor(geography, levels = .$geography))
+
 
 df_label <- 
     result %>% 
     bind_rows() %>% 
-    mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+    mutate(geography = paste0(factor(geography, levels = names(geo_lut), labels = geo_lut))) %>% 
+     mutate(geography = factor(geography, levels = us_result$geography)) %>% 
+    
     filter(within==1)  %>% 
     as_tibble() %>% 
     group_by(geography) %>%    
     filter(pct==max(pct)|pct==min(pct)) %>% 
     mutate(state = states[state]) %>% 
-    mutate(state = glue("{state} ({round(100*pct,0)}%)") )
+    mutate(state = glue("{state} ({round(100*pct,0)}%)") ) 
+    mutate(geography = forcats::fct_reorder(geography, ordering))
+
+    
 
 result %>% 
     bind_rows() %>% 
     filter(within==1) %>% 
-    mutate(geography = factor(geography, levels = names(geo_lut), labels = geo_lut)) %>% 
+    mutate(geography = paste0(factor(geography, levels = names(geo_lut), labels = geo_lut))) %>% 
+     mutate(geography = factor(geography, levels = us_result$geography)) %>% 
     ggplot(aes(x = pct, y = geography, group=state)) + geom_point() + 
     geom_text(data = df_label, aes(label =state),vjust=2,size=3) +
     hrbrthemes::theme_ipsum() + 
@@ -429,7 +452,8 @@ result %>%
     ggsci::scale_colour_futurama() +
     geom_point(data = us_result, colour = "red", size=5, pch=3) + 
     scale_x_continuous(limits = c(0,1),breaks=seq(0,1,0.1), labels = 100*seq(0,1,0.1))+
-    labs(x = "Percent of Hospital Utilization\n Contained Within Area",y="")
+    labs(x = "Percent of Hospital Utilization\n Contained Within Area",y="") + 
+    geom_text(data = us_result, colour = "red", aes(label = glue("{round(100*pct,0)}%")), vjust=2.5, size=3)
     #facet_grid(geography~.)
 
 ```
